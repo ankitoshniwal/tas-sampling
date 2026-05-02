@@ -1,0 +1,37 @@
+version: "3.8"
+
+services:
+  # OTel Collector with TAS processor
+  otelcol:
+    image: otel/opentelemetry-collector-contrib:0.96.0
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./config.yaml:/etc/otelcol/config.yaml
+    ports:
+      - "4317:4317"   # OTLP gRPC receiver
+      - "4318:4318"   # OTLP HTTP receiver
+      - "8888:8888"   # Prometheus metrics
+      - "55679:55679" # zPages (debug UI)
+    depends_on:
+      - jaeger
+
+  # Jaeger — visualizes which spans were sampled
+  jaeger:
+    image: jaegertracing/all-in-one:1.54
+    ports:
+      - "16686:16686" # Jaeger UI
+      - "14250:14250" # gRPC
+
+  # Span generator — simulates realistic log-normal + Zipfian traffic
+  # with injected P99 outliers to demonstrate TAS capture
+  spangenerator:
+    build:
+      context: ./spangenerator
+      dockerfile: Dockerfile
+    environment:
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otelcol:4317
+      - OUTLIER_RATE=0.001
+      - NUM_SERVICES=20
+      - SPANS_PER_SECOND=1000
+    depends_on:
+      - otelcol

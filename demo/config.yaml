@@ -1,0 +1,61 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # TAS: Threshold-Aware Sampling
+  # Replaces standard probabilistic_sampler or tail_sampling processor.
+  #
+  # Key parameters (from paper):
+  #   beta: 3.0     — optimal for log-normal service latency distributions
+  #   warmup_spans  — cold-start window; falls back to 1% random sampling
+  #
+  # To tune beta for your environment:
+  #   - Start with beta=3.0
+  #   - Monitor false_promotion_rate via /metrics
+  #   - Decrease beta if you're missing outliers (check P99 capture rate)
+  #   - Increase beta if storage costs are too high (too many promotions)
+  tas_sampler:
+    beta: 3.0
+    decay_factor: 0.95
+    decay_interval: 500ms
+    warmup_spans: 10000
+    cold_start_sampling_rate: 0.01
+    latency_attribute: "http.server.duration"
+
+  # Standard batch processor — always include for efficiency
+  batch:
+    timeout: 1s
+    send_batch_size: 1024
+
+exporters:
+  # Jaeger — for demo visualization
+  otlp/jaeger:
+    endpoint: jaeger:14250
+    tls:
+      insecure: true
+
+  # Debug exporter — logs sampling decisions to stdout
+  debug:
+    verbosity: detailed
+
+  # Prometheus — exposes TAS metrics
+  prometheus:
+    endpoint: "0.0.0.0:8888"
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [tas_sampler, batch]
+      exporters: [otlp/jaeger, debug]
+
+  telemetry:
+    logs:
+      level: info
+    metrics:
+      address: 0.0.0.0:8888

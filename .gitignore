@@ -1,0 +1,29 @@
+# Build artifacts
+*.o
+*.out
+tas_benchmark
+tas_reviewer
+tas_hotkey
+tas_coldstart
+tas_convergence
+tas_verify
+tas_subtle
+
+# Results
+*.txt
+*.csv
+!benchmarks/*.csv
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Go
+demo/spangenerator/go.sum
+demo/spangenerator/spangenerator
+
+# Docker
+demo/.env

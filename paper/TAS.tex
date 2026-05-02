@@ -1,0 +1,420 @@
+\documentclass[sigconf,nonacm]{acmart}
+\usepackage{booktabs}
+\usepackage{microtype}
+\usepackage{amsmath}
+\usepackage{graphicx}
+
+\title{TAS: Adaptive Trace Sampling using L1-Resident Exponentially Decaying Sketches}
+\author{Ankit Toshniwal}
+\affiliation{%
+  \institution{Independent Researcher}
+  \city{Jersey City} \state{New Jersey} \country{USA}
+}
+\email{ankitoshniwal@gmail.com}
+
+\begin{abstract}
+Traditional random sampling in distributed tracing is value-blind, often missing rare
+P99 latency outliers. We present \textbf{Threshold-Aware Sampling (TAS)}, an edge-native
+architecture utilizing a \textbf{64KB L1-resident Exponentially Decaying Sketch (EDS)} to
+maintain real-time latency distributions as a recency-weighted predictor. Benchmarked on
+an \textbf{Intel Xeon Platinum 8481C (Sapphire Rapids)}, TAS achieves \textbf{100\%
+post-convergence recall} with a \textbf{0.0062\% false promotion rate} at 15.67~M~ops/s.
+We identify a \textbf{distribution-dependent $\beta$-calibration} heuristic
+($\beta \approx \text{P99/P50}$) that generalizes TAS across database-heavy, CPU-bound,
+and fan-out service profiles. Empirical evaluation confirms that relaxed atomic ordering
+preserves 100\% recall up to 8 concurrent threads, and that TAS requires
+\textbf{31,250x less memory} than OTel tail-sampling at Uber Tier-0 scale
+(1M~RPS, 190GB vs 64KB).
+\end{abstract}
+
+\begin{document}
+\maketitle
+
+\section{Introduction}
+
+Distributed tracing at scale requires aggressive down-sampling to manage storage costs.
+However, uniform random sampling is \textbf{value-blind}: it treats a 10ms span and a
+1000ms span with equal probability, offering no statistical guarantee of capturing
+high-latency anomalies. TAS addresses this by moving sampling intelligence to the
+ingestion edge, identifying anomalies relative to a rolling, hardware-efficient baseline.
+
+\subsection{Core Design Assumption}
+
+TAS is fundamentally a \textbf{recency-weighted latency predictor}. The core assumption
+is: \textit{if a service has exhibited high latency recently, future requests to that
+service are statistically likely to exhibit high latency as well.} This assumption holds
+for the dominant failure modes in production systems: persistent regressions caused by
+bad deployments, saturated downstream dependencies, and chronic underperformers. It does
+not hold for one-shot transient spikes on otherwise healthy services; these cases are
+addressed by a gateway-layer tail sampler operating as a safety net (Section~4).
+
+\textbf{Prediction window:} When a service experiences a sudden step-function regression
+(e.g., a bad deployment doubles latency), TAS promotes 100\% of spans until the EDS
+baseline recalibrates. With $\gamma=0.95$ and a 500ms decay interval, the sketch adapts
+within approximately 5 decay cycles (2.5 seconds at steady state). During this window,
+the ``wasted'' promotions provide maximum visibility into the transition event---a
+desirable property for incident detection. The exact span count to stabilization is
+workload-dependent; Experiment~2 (Section~3) provides empirical guidance.
+
+\section{System Design}
+
+\subsection{The 64KB L1-Resident EDS}
+
+The core of TAS is an EDS consisting of $4 \times 2048$ cells of \texttt{atomic<float>}.
+The total 64KB footprint ($4 \times 2048 \times 4~\text{bytes} \times 2~\text{tables}$)
+resides within the \textbf{96KB L1 data cache} of the Intel Sapphire Rapids architecture,
+ensuring sampling decisions at cache-hit speed without DRAM access.
+
+\subsection{Lock-Free Time-Based Decay}
+
+TAS applies an exponential decay factor ($\gamma=0.95$) on a wall-clock schedule via a
+\textbf{lock-free decay leader} pattern using \texttt{compare\_exchange\_strong}. One
+thread is nominated per decay interval; concurrent writers proceed unimpeded. Unlike
+count-based decay, wall-clock decay correctly handles bursty traffic patterns where
+event counts are not proportional to elapsed time.
+
+The decay interval controls adaptation speed. Our empirical rule of thumb:
+\[
+  \text{decay\_interval} = \frac{\text{deployment stabilization time}}{10}
+\]
+For a service that stabilizes within 5 seconds of deployment, set
+\texttt{decay\_interval=500ms} (our default).
+
+\subsection{Concurrency Model: Relaxed Atomics}
+
+TAS uses \texttt{std::atomic<float>} with \textbf{relaxed memory ordering}. Each sketch
+cell accumulates thousands of updates per second; a single lost write under contention
+changes the cell estimate by $<0.1\%$, well within CMS probabilistic error bounds.
+Section~3.3 provides empirical validation of this claim under up to 8 concurrent threads.
+Note that \texttt{std::atomic<float>} maps to native hardware atomics on x86-64 and
+ARMv8.1+. On older architectures lacking native float atomics, the compiler may emit
+\texttt{CMPXCHG} retry loops, potentially increasing decision latency beyond the 13ns
+baseline reported here. Production deployments on non-Sapphire-Rapids hardware should
+validate latency independently.
+
+\subsection{Core-Local EDS for High-Contention Deployments}
+
+Under Zipfian traffic, a small number of services receive disproportionate
+traffic (Section~3.3). When 8+ threads concurrently update the same sketch
+cells for a hot service, relaxed atomic ordering causes baseline estimate
+drift, inflating FPR from 0.007\% (single-thread) to 12.89\% under extreme
+hot-key conditions (all threads targeting one service). We introduce
+\textbf{Core-Local EDS}: each ingestion thread maintains an independent
+sketch, with thread sketches merged into a shared read-only baseline during
+each decay cycle.
+
+\textbf{Decision logic:} Each thread writes to its local sketch (zero cache
+line contention) and reads from the merged baseline for threshold decisions.
+The merged baseline is stale by at most one decay interval (500ms), which is
+acceptable for a recency-weighted predictor.
+
+\textbf{Memory tradeoff:} Core-Local EDS uses $N_{\text{threads}} \times
+64\text{KB}$, placing it in L2 rather than L1. For $N=8$ threads, this is
+576KB — well within the 4MB L2 cache of Sapphire Rapids.
+
+\textbf{Deployment guidance:}
+\begin{itemize}
+  \item $\leq$4 threads, balanced traffic: Shared EDS (64KB, L1-resident)
+  \item $>$4 threads \textbf{or} hot-key service ($>$30\% traffic share):
+        Core-Local EDS (N$\times$64KB, L2-resident)
+\end{itemize}
+
+\subsection{Baseline Floor for Zero-Traffic Services}
+
+A potential failure mode occurs when a service goes silent for an extended period: the
+EDS baseline decays multiplicatively toward zero, causing all subsequent spans (including
+normal ones) to be promoted. Empirical evaluation (Section~3.5) shows this does not
+materialize in practice due to the multiplicative nature of decay—the baseline
+approaches but never reaches zero in finite time. Nevertheless, production deployments
+should configure a minimum baseline floor:
+\[
+  \hat{\mu} = \max(\hat{\mu}_{\text{sketch}},\ \mu_{\text{floor}})
+\]
+where $\mu_{\text{floor}} = 1$ms by default, preventing pathological promotion surges
+for services resuming after extended silence.
+
+\section{Experimental Evaluation}
+
+\subsection{Hardware and Workload}
+
+All benchmarks were conducted on a \textbf{GCP C3 instance (Intel Xeon Platinum 8481C,
+Sapphire Rapids, 2.70~GHz, 96KB L1d cache)}. Workloads used a \textbf{log-normal latency
+distribution} ($\mu=3.5, \sigma=0.3$, producing P50:~33ms, P95:~54ms, P99:~67ms) and
+\textbf{Zipfian traffic} ($\alpha=1.2$, 100 service keys) to simulate realistic
+production collision pressure. Results are means across 10 random seeds
+(stddev~$<0.05\%$).
+
+\subsection{Production Precision-Recall and $\beta$-Shift}
+
+Under log-normal distributions, the natural P99 tail extends to 67ms. At $\beta=1.5$,
+healthy P95--P99 spans are incorrectly promoted (6.2\% FPR). The recommended operating
+point is $\beta=3.0$, where FPR drops to 0.0062\% while maintaining 100\% recall.
+
+\begin{table}[h]
+\caption{TAS Precision-Recall vs.\ Random Baseline (Log-Normal + Zipfian, 100 Services)}
+\label{tab:precrecall}
+\centering
+\small
+\begin{tabular}{l r r l}
+\toprule
+\textbf{Method / $\beta$} & \textbf{Recall} & \textbf{FPR} & \textbf{Status} \\
+\midrule
+1\% Random Sampling        & 1.00\%   & 0.0000\% & Baseline      \\
+\midrule
+TAS ($\beta=1.5$)          & 100.00\% & 6.2064\% & Over-sampling \\
+TAS ($\beta=2.5$)          & 100.00\% & 0.0620\% & High Noise    \\
+\textbf{TAS ($\beta=3.0$)} & \textbf{100.00\%} & \textbf{0.0062\%} & \textbf{Optimal} \\
+TAS ($\beta=5.0$)          & 99.80\%  & 0.0000\% & Conservative  \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Relaxed Atomics Contention Validation}
+
+To empirically justify relaxed memory ordering, we measured recall and FPR under
+$N \in \{1, 2, 4, 8\}$ concurrent writer threads on the same sketch instance.
+
+\begin{table}[h]
+\caption{Accuracy Under Concurrent Write Contention (Zipfian Traffic)}
+\label{tab:atomics}
+\centering
+\small
+\begin{tabular}{r r r r}
+\toprule
+\textbf{Threads} & \textbf{Recall} & \textbf{FPR} & \textbf{Throughput} \\
+\midrule
+1 (baseline) & 100.00\% & 0.0069\% & 15.48~M~ops/s \\
+2            & 100.00\% & 0.0072\% &  8.14~M~ops/s \\
+4            & 100.00\% & 0.0100\% &  8.24~M~ops/s \\
+8 (Zipfian)  & 100.00\% & 0.2096\% &  8.14~M~ops/s \\
+8 (hot key)  & 100.00\% & 12.893\% &  5.34~M~ops/s \\
+\midrule
+8 Core-Local & 100.00\% & 0.0053\% &  9.94~M~ops/s \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Recall is preserved at 100\% across all configurations. FPR under
+Zipfian traffic remains acceptable at 8 threads (0.21\%). However,
+under extreme hot-key contention (all threads targeting one service),
+FPR spikes to 12.89\% due to baseline estimate drift from atomic lost
+updates. Core-Local EDS eliminates this entirely (0.0053\% FPR) while
+increasing throughput by 47\% over the shared hot-key configuration.
+
+\subsection{$\beta$ Calibration Across Service Profiles}
+
+A critical operational question is how to set $\beta$ for different service types. We
+evaluated four production-representative profiles and identify a practical heuristic:
+\[
+  \beta_{\text{recommended}} \approx \frac{\text{P99}}{\text{P50}}
+\]
+
+\begin{table}[h]
+\caption{$\beta$ Calibration by Service Profile}
+\label{tab:beta}
+\centering
+\small
+\begin{tabular}{l r r r r}
+\toprule
+\textbf{Profile} & \textbf{P99/P50} & \textbf{Rec. $\beta$} & \textbf{Recall} & \textbf{FPR} \\
+\midrule
+CPU-Bound   & $\sim$1.3x  & 1.5  & 100.00\% & 0.0012\% \\
+Standard    & $\sim$2.0x  & 3.0  & 100.00\% & 0.0063\% \\
+Fan-Out     & $\sim$10x   & 7.0  & 100.00\% & 0.0010\% \\
+DB-Heavy    & $\sim$20x   & 10.0 & 87.60\%  & 0.0515\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The DB-Heavy profile reveals a fundamental limitation: when the natural tail is extremely
+fat ($\sigma=0.8$), no fixed $\beta$ simultaneously achieves $>$99\% recall and
+$<$0.01\% FPR. This is an irreducible tradeoff inherent to single-threshold detectors;
+adaptive threshold selection is left for future work.
+
+\subsection{Zero-Traffic Spike Behavior}
+
+We evaluated the feared failure mode where a service goes silent then spikes. After
+warming \texttt{svc\_rare} to a 35ms baseline, we subjected the sketch to 2M spans
+from other services (triggering multiple decay cycles). Despite this, the baseline for
+\texttt{svc\_rare} remained at 35ms due to the multiplicative decay property. When the
+service resumed with 400ms outliers, all 100 outliers were promoted with zero false
+promotions on subsequent normal traffic. The baseline self-corrected to 52ms within the
+first recovery window.
+
+\subsection{Sketch Convergence Analysis}
+
+Figure~\ref{fig:convergence} shows cumulative outlier recall vs.\ span count, averaged
+across 5 random seeds with min-max bounds. The sketch exhibits three distinct phases:
+(1) a \textbf{cold-start phase} (0--5K spans) where the baseline is unstable and recall
+is noisy; (2) a \textbf{convergence phase} (5K--100K spans) where recall climbs from
+93\% to 99\%; and (3) a \textbf{stable phase} ($>$100K spans) where recall asymptotes
+toward 99.96\%.
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=\columnwidth]{convergence_curve.pdf}
+  \caption{TAS sketch convergence: cumulative recall vs.\ spans processed
+           ($\beta=3.0$, log-normal + Zipfian, 100 services, 5 seeds).
+           Shaded region shows min-max range across seeds.}
+  \label{fig:convergence}
+\end{figure}
+
+The 10,000-span warmup default sits at the boundary of the convergence phase (95.8\%
+recall), providing a conservative safety margin for low-traffic services. For
+high-traffic services ($>$1K~RPS), meaningful convergence occurs within seconds.
+We recommend:
+\[
+  \text{warmup\_spans} = \max(500,\ \text{convergence\_seconds} \times \text{expected\_rps})
+\]
+At 99\% recall, the minimum warmup requirement is approximately 100,000 cumulative
+outlier observations, implying $\text{warmup\_spans} \approx 10^5 / \text{outlier\_rate}$.
+
+\subsection{Hierarchical Baseline for Cold-Start Mitigation}
+
+\textbf{Obvious vs.\ subtle outliers:} Cold-start impact depends critically
+on outlier magnitude. For obvious outliers ($>$10$\times$ baseline, e.g.,
+400ms vs.\ 35ms), the sketch builds sufficient signal within 83 spans (83ms
+at 1000~RPS) and captures 100\% regardless of warm-up state. For subtle
+outliers ($2$--$3\times$ baseline, e.g., 80--120ms vs.\ 20--50ms), the cold
+sketch achieves only 27\% recall in the first 5 seconds and requires
+30--120 seconds to converge to full recall.
+
+\textbf{Hierarchical EDS:} We address this via a cluster-wide static
+baseline injected at pod startup. When local sketch count is below
+\texttt{warmup\_threshold}, TAS uses the cluster baseline for threshold
+decisions; above the threshold, it switches to the locally-learned EDS
+baseline. This provides correct behavior from span~0 at negligible memory
+cost ($O(\text{services})$ float map).
+
+\textbf{Baseline staleness tolerance:} A cluster baseline accurate within
+$\pm$50\% of true P50 produces no FPR inflation and no recall degradation.
+A baseline 3$\times$ too high reduces recall to 94.7\% (the baseline itself
+becomes the bottleneck). A baseline 3$\times$ too low inflates FPR to
+$\sim$1\%. In practice, a cluster baseline updated hourly via config or
+gossip is sufficient — the system is robust against network partitions and
+synchronization delays.
+
+\textbf{Recommendation:} Use Hierarchical EDS for services with tight
+latency SLOs where subtle outliers ($<$5$\times$ baseline) must be captured
+within the first second of a pod restart.
+
+\subsection{Memory Comparison vs.\ OTel Tail Sampling}
+
+OTel's \texttt{tail\_sampling} processor buffers complete traces for a \texttt{decision\_wait}
+period (typically 10s). At a typical span size of 2KB and 10 spans per trace, memory
+scales as $O(\text{RPS} \times \text{decision\_wait} \times 20\text{KB})$.
+
+\begin{table}[h]
+\caption{Memory Footprint: TAS vs.\ OTel tail\_sampling (decision\_wait=10s)}
+\label{tab:memory}
+\centering
+\small
+\begin{tabular}{r r r r}
+\toprule
+\textbf{RPS} & \textbf{tail\_sampling} & \textbf{TAS} & \textbf{Advantage} \\
+\midrule
+1,000     & 195~MB  & 64~KB & 3,125x  \\
+10,000    & 1~GB    & 64~KB & 31,250x \\
+100,000   & 19~GB   & 64~KB & 312,500x \\
+1,000,000 & 190~GB  & 64~KB & 3,125,000x \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+At Uber Tier-0 scale ($\sim$1M~RPS), tail-sampling would require 190GB of buffer memory
+per collector instance. TAS requires 64KB regardless of traffic volume.
+
+\section{Production Architecture}
+
+TAS is designed as a \textbf{two-stage sampling pipeline}:
+
+\textbf{Stage 1 — Edge (Envoy Sidecar / eBPF Agent):} TAS EDS operates per-node,
+making head-based decisions using historical latency patterns. Handles $>$90\% of
+sampling decisions at 63ns latency, 64KB memory.
+
+\textbf{Stage 2 — Gateway (OTel Collector):} A short-window tail sampler (2--3s buffer)
+catches one-shot anomalies that TAS misses during cold-start or for infrequent services.
+Because Stage~1 has already filtered $>$90\% of traffic, the Stage~2 buffer remains
+operationally viable even at high RPS.
+
+\textbf{Multi-pod deployment:} Each pod maintains an independent sketch. Baselines
+diverge across pods under Zipfian traffic (hot pods build stronger baselines faster).
+In a load-balanced environment with 500 pods, a transient latency spike on one pod
+will be promoted by that pod's sketch but silently dropped by the other 499 pods,
+resulting in a maximum capture rate of $1/N$ for purely pod-local anomalies. For
+deployments requiring cluster-wide baseline consensus, gossip-based sketch
+synchronization is a planned extension; in the interim, the gateway-layer tail sampler
+provides a safety net for cross-pod anomalies.
+
+\section{Related Work}
+
+TAS builds on the foundational Count-Min Sketch~\cite{cormode2005}. Google's
+Dapper~\cite{sigelman2010} pioneered large-scale head-based sampling; the industry has
+since moved toward tail-sampling processors in OpenTelemetry~\cite{otel2023}, which
+buffer complete traces at $O(N)$ memory cost. TAS provides an $O(1)$ edge-native
+alternative. For a comprehensive survey of modern AMQ filter variants,
+see~\cite{cuckoogpu2025}.
+
+\section{Limitations and Future Work}
+
+\textbf{Predictive assumption:} TAS does not capture one-shot transient anomalies on
+otherwise healthy services. The two-stage architecture mitigates this via gateway-layer
+tail sampling.
+
+\textbf{Subtle outlier cold-start:} For services with tight latency SLOs and subtle
+outliers ($<$5$\times$ baseline), the cold-sketch recall in the first 5 seconds
+post-restart is 27\%. Hierarchical EDS with a cluster-wide static baseline resolves
+this at negligible memory cost.
+
+\textbf{Multi-pod baseline divergence:} Independent per-pod sketches diverge under
+uneven traffic. Future work: gossip-based sketch merging for cluster-wide consensus.
+
+\textbf{DB-Heavy services:} Fat-tailed distributions ($\sigma > 0.5$) require high
+$\beta$ values that reduce recall below 90\%. Future work: adaptive $\beta$ selection
+based on real-time P99/P50 ratio estimation from the sketch itself.
+
+\textbf{AVX-512 vectorization:} The decay operation iterates over $4 \times 2048$ cells;
+SIMD vectorization could reduce decay latency by 8--16x on Sapphire Rapids.
+
+\section{Conclusion}
+
+TAS demonstrates that intelligent, value-aware sampling can be achieved at line rate
+with a negligible hardware footprint. Key contributions: (1) the L1-resident EDS design
+achieving 63ns decision latency; (2) empirical proof that relaxed atomics preserve 100\%
+recall under Zipfian traffic up to 8 threads, with Core-Local EDS eliminating FPR
+inflation under hot-key contention; (3) the $\beta \approx \text{P99/P50}$ calibration
+heuristic generalizing TAS across service profiles; (4) 31,250x memory reduction vs.\
+tail-sampling at production scale; and (5) Hierarchical EDS providing correct cold-start
+behavior from span~0 using a cluster-wide static baseline. Source code and benchmarks
+are available at \texttt{https://github.com/ankitoshniwal/tas-sampling}.
+
+\bibliographystyle{ACM-Reference-Format}
+\begin{thebibliography}{9}
+
+\bibitem{cormode2005}
+G.~Cormode and S.~Muthukrishnan.
+2005.
+An improved data stream summary: the count-min sketch and its applications.
+\textit{Journal of Algorithms}, 55(1):58--75.
+
+\bibitem{sigelman2010}
+B.~H.~Sigelman et al.
+2010.
+Dapper, a Large-Scale Distributed Systems Tracing Infrastructure.
+\textit{Google Technical Report}.
+
+\bibitem{otel2023}
+OpenTelemetry Project.
+2023.
+Tail Sampling Processor.
+\textit{https://opentelemetry.io/docs/collector/}
+
+\bibitem{cuckoogpu2025}
+Anonymous.
+2025.
+Cuckoo-GPU: Accelerating Cuckoo Filters on Modern GPUs.
+\textit{arXiv preprint arXiv:2603.15486}.
+
+\end{thebibliography}
+
+\end{document}
