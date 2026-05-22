@@ -152,12 +152,16 @@ eliminating cache line contention at the cost of L2 vs L1 residency.
 ## Citation
 
 ```bibtex
-@article{toshniwal2026tas,
-  title={TAS: Adaptive Trace Sampling using L1-Resident Exponentially Decaying Sketches},
-  author={Toshniwal, Ankit},
-  journal={arXiv preprint},
-  year={2026}
-}
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+authors:
+  - family-names: Toshniwal
+    given-names: Ankit
+title: "TAS: Adaptive Trace Sampling using Cache-Resident Exponentially Decaying Sketches"
+version: 1.0
+date-released: 2026-05-22
+doi: 10.5281/zenodo.20337623
+url: "https://github.com/ankitoshniwal/tas-sampling"
 ```
 
 ## License
